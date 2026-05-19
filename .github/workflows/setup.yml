@@ -1,0 +1,76 @@
+name: TurboLink Setup
+
+on:
+  workflow_dispatch:
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.22.0"
+
+      - name: Create Flutter App
+        run: |
+          flutter create .
+
+      - name: Create Structure
+        run: |
+          mkdir -p lib/core/theme
+          mkdir -p lib/screens/home
+          mkdir -p lib/screens/send
+          mkdir -p lib/screens/receive
+          mkdir -p lib/screens/discovery
+          mkdir -p lib/screens/transfer
+          mkdir -p lib/widgets
+          mkdir -p lib/services/wifi
+          mkdir -p lib/services/transfer
+          mkdir -p lib/providers
+
+      - name: Write main.dart
+        run: |
+          cat > lib/main.dart << 'EOF'
+          import 'package:flutter/material.dart';
+
+          void main() {
+            runApp(const TurboLinkApp());
+          }
+
+          class TurboLinkApp extends StatelessWidget {
+            const TurboLinkApp({super.key});
+
+            @override
+            Widget build(BuildContext context) {
+              return MaterialApp(
+                debugShowCheckedModeBanner: false,
+                title: 'TurboLink',
+                theme: ThemeData.dark(),
+                home: const Scaffold(
+                  body: Center(
+                    child: Text(
+                      'TurboLink ⚡',
+                      style: TextStyle(fontSize: 32),
+                    ),
+                  ),
+                ),
+              );
+            }
+          }
+          EOF
+
+      - name: Install Packages
+        run: flutter pub get
+
+      - name: Commit Files
+        run: |
+          git config --global user.name github-actions
+          git config --global user.email github-actions@github.com
+          git add .
+          git commit -m "TurboLink Initial Setup"
+          git push
