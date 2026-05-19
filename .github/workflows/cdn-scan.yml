@@ -1,0 +1,278 @@
+name: CDN Edge IP Scanner
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  scan-cdn-ips:
+    runs-on: ubuntu-latest
+    timeout-minutes: 370
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_PAT }}
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Create scanner script inline
+        run: |
+          mkdir -p scripts results
+          cat > scripts/cdn_scanner.py << 'PYTHON_SCRIPT'
+          import os, sys, time, socket, random, subprocess, ipaddress
+          import threading, datetime, logging, concurrent.futures
+          from pathlib import Path
+
+          RUN_DURATION_SECONDS  = 6 * 3600
+          WRITE_INTERVAL        = 10
+          MAX_FILE_SIZE         = 250 * 1024
+          RESULTS_DIR           = Path("results")
+          SCAN_WORKERS          = 150
+          TIMEOUT               = 3
+          PUSH_INTERVAL         = 10
+
+          logging.basicConfig(level=logging.INFO,
+              format="%(asctime)s [%(levelname)s] %(message)s",
+              datefmt="%Y-%m-%d %H:%M:%S")
+          log = logging.getLogger("cdn_scanner")
+
+          CDN_IP_RANGES = {
+              "Cloudflare": [
+                  "103.21.244.0/22","103.22.200.0/22","103.31.4.0/22",
+                  "104.16.0.0/13","104.24.0.0/14","108.162.192.0/18",
+                  "131.0.72.0/22","141.101.64.0/18","162.158.0.0/15",
+                  "172.64.0.0/13","173.245.48.0/20","188.114.96.0/20",
+                  "190.93.240.0/20","197.234.240.0/22","198.41.128.0/17",
+              ],
+              "Fastly": [
+                  "23.235.32.0/20","43.249.72.0/22","103.244.50.0/24",
+                  "104.156.80.0/20","151.101.0.0/16","157.52.64.0/18",
+                  "167.82.0.0/17","185.31.16.0/22","199.27.72.0/21",
+                  "199.232.0.0/16",
+              ],
+              "AWS_CloudFront": [
+                  "13.32.0.0/15","13.35.0.0/16","52.46.0.0/18",
+                  "52.84.0.0/15","52.222.128.0/17","54.182.0.0/16",
+                  "54.192.0.0/16","54.230.0.0/16","64.252.64.0/18",
+                  "65.8.0.0/16","70.132.0.0/18","99.84.0.0/16",
+                  "205.251.192.0/19","216.137.32.0/19",
+              ],
+              "Akamai": [
+                  "23.32.0.0/11","23.64.0.0/14","23.72.0.0/13",
+                  "63.208.195.0/24","72.246.0.0/15","88.221.0.0/16",
+                  "92.122.0.0/15","95.100.0.0/15","96.6.0.0/15",
+                  "104.64.0.0/10","173.222.0.0/15","184.24.0.0/13",
+              ],
+              "Cloudflare_Relay": [
+                  "162.159.0.0/16","162.158.0.0/15",
+                  "104.16.0.0/12","172.64.0.0/13",
+              ],
+              "KeyCDN": [
+                  "37.48.64.0/18","94.46.0.0/18","185.34.8.0/22",
+              ],
+              "Bunny_CDN": [
+                  "185.152.66.0/24","185.152.67.0/24",
+              ],
+              "StackPath": [
+                  "151.139.0.0/16","198.57.240.0/21",
+              ],
+          }
+
+          def generate_ips(cdn_ranges):
+              ips = []
+              for cdn, ranges in cdn_ranges.items():
+                  for cidr in ranges:
+                      try:
+                          net = ipaddress.ip_network(cidr, strict=False)
+                          hosts = list(net.hosts())
+                          sample = random.sample(hosts, min(400, len(hosts)))
+                          ips.extend((str(ip), cdn) for ip in sample)
+                      except ValueError:
+                          continue
+              random.shuffle(ips)
+              log.info(f"Generated {len(ips)} IPs from {len(cdn_ranges)} CDNs")
+              return ips
+
+          def test_ip(ip, cdn):
+              result = {"ip": ip, "cdn": cdn, "port_443": False,
+                        "port_80": False, "latency_ms": None, "alive": False,
+                        "ts": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")}
+              for port in [443, 80]:
+                  try:
+                      t = time.monotonic()
+                      s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                      s.settimeout(TIMEOUT)
+                      if s.connect_ex((ip, port)) == 0:
+                          ms = round((time.monotonic()-t)*1000, 1)
+                          result[f"port_{port}"] = True
+                          result["alive"] = True
+                          if result["latency_ms"] is None:
+                              result["latency_ms"] = ms
+                      s.close()
+                  except Exception:
+                      pass
+              return result if result["alive"] else None
+
+          class FileManager:
+              def __init__(self, d):
+                  self.d = d
+                  self.d.mkdir(parents=True, exist_ok=True)
+                  self.idx = self._next_idx()
+                  self.cur = self._new_file()
+                  self.lock = threading.Lock()
+                  self.buf = []
+                  self.total = 0
+              def _next_idx(self):
+                  fs = list(self.d.glob("cdn_ips_*.txt"))
+                  if not fs: return 1
+                  nums = []
+                  for f in fs:
+                      try: nums.append(int(f.stem.split("_")[-1]))
+                      except: pass
+                  return max(nums)+1 if nums else 1
+              def _fname(self, i): return self.d / f"cdn_ips_{i:04d}.txt"
+              def _new_file(self):
+                  p = self._fname(self.idx)
+                  p.write_text(
+                      f"# CDN Edge IP Scanner | File {self.idx:04d}\n"
+                      f"# Started: {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
+                      f"# Format: IP | CDN | Latency | 443 | 80 | Timestamp\n"
+                      f"{'=' * 70}\n", encoding="utf-8")
+                  log.info(f"New file: {p.name}")
+                  return p
+              def add(self, results):
+                  with self.lock:
+                      for r in results:
+                          self.buf.append(
+                              f"{r['ip']} | {r['cdn']} | {r['latency_ms']}ms | "
+                              f"{'Y' if r['port_443'] else 'N'}:443 | "
+                              f"{'Y' if r['port_80'] else 'N'}:80 | {r['ts']}\n")
+              def flush(self):
+                  with self.lock:
+                      lines = self.buf[:]
+                      self.buf.clear()
+                  if not lines: return
+                  for line in lines:
+                      if self.cur.exists() and self.cur.stat().st_size >= MAX_FILE_SIZE:
+                          self.idx += 1
+                          self.cur = self._new_file()
+                      with open(self.cur, "a", encoding="utf-8") as f:
+                          f.write(line)
+                      self.total += 1
+              def stats(self):
+                  fs = list(self.d.glob("cdn_ips_*.txt"))
+                  sz = sum(f.stat().st_size for f in fs)
+                  return {"files": len(fs), "total": self.total,
+                          "size_kb": round(sz/1024, 1),
+                          "cur_kb": round(self.cur.stat().st_size/1024,1) if self.cur.exists() else 0}
+
+          def git_push(msg, pat, repo):
+              try:
+                  url = f"https://x-access-token:{pat}@github.com/{repo}.git"
+                  for cmd in [
+                      ["git","config","user.email","cdn-bot@github.com"],
+                      ["git","config","user.name","CDN Scanner Bot"],
+                      ["git","remote","set-url","origin", url],
+                      ["git","add","results/"],
+                  ]:
+                      subprocess.run(cmd, capture_output=True, check=True)
+                  diff = subprocess.run(["git","diff","--staged","--quiet"], capture_output=True)
+                  if diff.returncode != 0:
+                      subprocess.run(["git","commit","-m",msg], capture_output=True, check=True)
+                      subprocess.run(["git","push","origin","HEAD"], capture_output=True, check=True)
+                      log.info(f"Pushed: {msg[:60]}")
+              except Exception as e:
+                  log.warning(f"Push failed: {e}")
+
+          def main():
+              pat  = os.environ.get("GH_PAT","")
+              repo = os.environ.get("GITHUB_REPOSITORY","")
+              if not pat:  log.warning("GH_PAT not set - push disabled")
+              if not repo: log.warning("GITHUB_REPOSITORY not set")
+
+              fm   = FileManager(RESULTS_DIR)
+              ips  = generate_ips(CDN_IP_RANGES)
+              t0   = time.monotonic()
+              tend = t0 + RUN_DURATION_SECONDS
+              cur  = 0
+              buf  = []
+              t_write = t_push = time.monotonic()
+              scanned = alive = 0
+
+              log.info(f"Scanner started | Duration: 6h | Workers: {SCAN_WORKERS}")
+
+              with concurrent.futures.ThreadPoolExecutor(max_workers=SCAN_WORKERS) as ex:
+                  futs = {}
+                  while time.monotonic() < tend:
+                      now = time.monotonic()
+                      while len(futs) < SCAN_WORKERS * 2:
+                          ip, cdn = ips[cur % len(ips)]
+                          cur += 1
+                          if cur >= len(ips):
+                              ips = generate_ips(CDN_IP_RANGES)
+                              cur = 0
+                          futs[ex.submit(test_ip, ip, cdn)] = True
+                      done = [f for f in futs if f.done()]
+                      for f in done:
+                          futs.pop(f)
+                          scanned += 1
+                          try:
+                              r = f.result(timeout=0.1)
+                              if r: alive += 1; buf.append(r)
+                          except: pass
+                      if now - t_write >= WRITE_INTERVAL and buf:
+                          fm.add(buf); buf.clear(); fm.flush()
+                          t_write = now
+                          s = fm.stats()
+                          el = (now-t0)/60; rem = (tend-now)/60
+                          log.info(f"[{el:.0f}m elapsed | {rem:.0f}m left] "
+                                   f"alive={s['total']} scanned={scanned} "
+                                   f"files={s['files']} size={s['size_kb']}KB")
+                      if now - t_push >= PUSH_INTERVAL and pat and repo:
+                          s = fm.stats()
+                          threading.Thread(target=git_push, daemon=True, args=(
+                              f"[scan] {s['total']} IPs | {s['files']} files | "
+                              f"{s['size_kb']}KB - {datetime.datetime.utcnow().strftime('%H:%M UTC')}",
+                              pat, repo)).start()
+                          t_push = now
+                      time.sleep(0.05)
+
+              if buf: fm.add(buf); fm.flush()
+              s = fm.stats()
+              log.info(f"Done! IPs={s['total']} files={s['files']} size={s['size_kb']}KB scanned={scanned}")
+              if pat and repo:
+                  git_push(f"[done] {s['total']} IPs | {s['files']} files | {s['size_kb']}KB", pat, repo)
+
+          if __name__ == "__main__":
+              main()
+          PYTHON_SCRIPT
+          echo "Script created OK"
+          ls -la scripts/
+
+      - name: Run CDN IP Scanner
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: python scripts/cdn_scanner.py
+
+      - name: Final push
+        if: always()
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          git config user.email "cdn-bot@github.com"
+          git config user.name "CDN Scanner Bot"
+          git remote set-url origin https://x-access-token:${GH_PAT}@github.com/${{ github.repository }}.git
+          git add results/ || true
+          git diff --staged --quiet || git commit -m "Final results $(date -u '+%Y-%m-%d %H:%M UTC')"
+          git push origin HEAD || true
