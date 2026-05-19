@@ -17,7 +17,7 @@ jobs:
       - name: Setup Java
         uses: actions/setup-java@v4
         with:
-          distribution: 'temurin'
+          distribution: temurin
           java-version: '17'
 
       - name: Setup Flutter
@@ -50,6 +50,16 @@ jobs:
 
           mkdir -p lib/providers
 
+      - name: Add Dependencies
+        run: |
+          sed -i '/dependencies:/a\
+            flutter_riverpod: ^2.5.1\
+            file_picker: ^8.0.0\
+            mobile_scanner: ^5.1.1\
+            permission_handler: ^11.3.1\
+            network_info_plus: ^5.0.3\
+            google_fonts: ^6.2.1' pubspec.yaml
+
       - name: Create main.dart
         run: |
           cat > lib/main.dart << 'EOF'
@@ -70,9 +80,9 @@ jobs:
                 theme: ThemeData(
                   brightness: Brightness.dark,
                   scaffoldBackgroundColor: const Color(0xFF0A0A0A),
-                  colorScheme: ColorScheme.dark(
-                    primary: const Color(0xFF00D1FF),
-                    secondary: const Color(0xFFB026FF),
+                  colorScheme: const ColorScheme.dark(
+                    primary: Color(0xFF00D1FF),
+                    secondary: Color(0xFFB026FF),
                   ),
                 ),
                 home: const HomeScreen(),
@@ -237,29 +247,16 @@ jobs:
           }
           EOF
 
-      - name: Add Dependencies
-        run: |
-          cat >> pubspec.yaml << 'EOF'
-
-          dependencies:
-            flutter_riverpod: ^2.5.1
-            file_picker: ^8.0.0
-            mobile_scanner: ^5.1.1
-            permission_handler: ^11.3.1
-            network_info_plus: ^5.0.3
-            google_fonts: ^6.2.1
-          EOF
-
       - name: Install Packages
         run: flutter pub get
 
-      - name: Commit & Push
+      - name: Commit and Push
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           git add .
 
-          git commit -m "TurboLink Initial Setup" || echo "No changes to commit"
+          git commit -m "TurboLink Initial Setup" || echo "No changes"
 
           git push
